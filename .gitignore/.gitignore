@@ -1,0 +1,802 @@
+using UnityEngine;
+using System.Collections;
+using LitJson;
+using System.Collections.Generic;
+
+/// <summary>
+/// 玩家子弹控制
+/// </summary>
+public class BulletWSCtrl : WSCtrl {
+
+	//子弹信息
+	public struct BulletInfo{
+		public int bullet_type;
+		public uint bullet_rate;
+		public float pos_x;
+		public float pos_y;
+//		public int is_lock;
+		public string lock_id;
+		public int is_rage;
+	}
+
+	//奖励信息
+	public struct PrizeInfo{
+		public int prize_type;
+		public uint prize_amount;
+	}
+
+	//击中鱼的信息
+	public struct DeadInfo{
+		public string id;
+		public uint rate;
+		public PrizeInfo[] prizes;
+	}
+
+	//boss击中消息
+	public class BigBossInfo
+	{
+		public uint callplay_id;
+		public string id;
+		public bool is_die;
+		public PrizeInfo[] catch_prizes;  //捕获者奖励
+		public PrizeInfo[] call_prizes;  //召唤者奖励
+	}
+
+	public struct IntegralData//自由场的积分数据;
+	{
+		public long server_time;    //服务器时间戳;
+		public long  total_num_points;//自由场当天捕鱼积分总数;
+		public bool isok;
+	}
+	public struct BuffInfo{
+		public int bufftype;//buff类型
+		public string fishid;//鱼id
+		public int award;//奖励
+	}
+	private long tmpGold;//临时储存金币数量‘
+	private bool isSysGold=true;//是否同步金币；
+	private int notshoottime=0;//子弹碰撞不能同步金币的次数;
+	public event GameNotifyDelegate LaunchCallback;
+	public event GameNotifyDelegate FireCallback;
+	public event GameNotifyDelegate HitCallback;
+	//其他座位玩家发射子弹
+	public event GameNotifyDelegate OnOtherLaunch;
+
+	private GamePlayerModel _playerModel;  //玩家数据模型
+	private MatchGamePlayerModel _matchplayerModel;
+	//构造方法
+	public BulletWSCtrl(){
+		_playerModel = ModelManager.GamePlayerModel;
+		_matchplayerModel = ModelManager.MatchGamePlayerModel;
+	}
+
+	#region 发送请求的数据
+	//发送子弹的请求
+	private struct LaunchRequest : IRequest{
+		public string client_cmd;
+		public double pos_x;
+		public double pos_y;
+//		public int is_lock;
+		public string lock_id;
+		public int is_rage;
+
+		public string GenerateData(){
+			string json = null;
+			try{
+				JsonData json_data = new JsonData();
+				json_data["client_cmd"] = this.client_cmd;
+				json_data["args"] = new JsonData();
+				json_data["args"].Add(this.pos_x);
+				json_data["args"].Add(this.pos_y);
+//				json_data["args"].Add(this.is_lock);
+				json_data["args"].Add(this.lock_id);
+				json_data["args"].Add(this.is_rage);
+				json = JsonMapper.ToJson(json_data);
+			}
+			catch(System.Exception e){
+                Debug.LogWarning(e);
+            }
+			return json;
+		}
+	}
+
+	//发送子弹的请求
+	private struct FireRequest : IRequest{
+		public int cc;
+		public string bullet_id;
+		public double pos_x;
+		public double pos_y;
+//		public int is_lock;
+		public string lock_id;
+		public int is_rage;
+
+		public string GenerateData(){
+			string json = null;
+			try{
+				JsonData json_data = new JsonData();
+				json_data["cc"] = 204;
+				json_data["av"] = new JsonData();
+				json_data["av"].Add(this.bullet_id);
+				json_data["av"].Add(this.pos_x);
+				json_data["av"].Add(this.pos_y);
+//				json_data["args"].Add(this.is_lock);
+				json_data["av"].Add(this.lock_id);
+				json_data["av"].Add(this.is_rage);
+				json = JsonMapper.ToJson(json_data);
+			}
+			catch(System.Exception e){
+                Debug.LogWarning(e);
+            }
+			return json;
+		}
+	}
+
+	//发送子弹碰撞请求
+	public struct HitRequest : IRequest{
+		public int cc;
+		public string bullet_id;
+		public double pos_x;
+		public double pos_y;
+		public int hit_type;
+		public string[] fishs;  //第一个为子弹碰撞的鱼
+
+		public string GenerateData(){
+			string json = null;
+			try{
+				JsonData json_data = new JsonData();
+				json_data["cc"] = 205;
+				json_data["av"] = new JsonData();
+				json_data["av"].Add(this.bullet_id);
+				json_data["av"].Add(this.pos_x);
+				json_data["av"].Add(this.pos_y);
+				json_data["av"].Add(this.hit_type);
+				for(int i=0;i<fishs.Length; i++){
+					json_data["av"].Add(this.fishs[i]);
+				}
+
+				json = JsonMapper.ToJson(json_data);
+			}
+			catch(System.Exception e){
+                Debug.LogWarning(e);
+            }
+			return json;
+		}
+	}
+	//换炮请求
+	private struct ChangeRequest: IRequest{
+		public int cc;
+		public uint av;
+		public string GenerateData(){
+			string json = null;
+			try{
+				json = JsonMapper.ToJson (this);
+			}
+			catch(System.Exception e){
+                Debug.LogWarning(e);
+            }
+			return json;
+		}
+	}
+
+	#endregion
+
+	#region 接受响应的数据
+
+	//子弹发射消息
+	public struct LaunchResponse : IResponse{
+		public string id;
+		public int position;
+		public long gold_amount;
+		public BulletInfo bullet;
+
+		//解析
+		public void ParseData (LitJson.JsonData json_data){
+			try{
+				if(json_data.Keys.Contains("data")){
+					JsonData bullet_data = json_data["data"];
+					if(bullet_data.IsArray && bullet_data.Count == 9){
+						this.position = int.Parse(bullet_data[0].ToString());
+						this.gold_amount = long.Parse(bullet_data[1].ToString());
+						this.id = bullet_data[2].ToString();
+						this.bullet = new BulletInfo();
+						this.bullet.bullet_type = int.Parse(bullet_data[3].ToString());
+						this.bullet.bullet_rate = uint.Parse(bullet_data[4].ToString());
+						this.bullet.pos_x = float.Parse(bullet_data[5].ToString());
+						this.bullet.pos_y = float.Parse(bullet_data[6].ToString());
+//						this.bullet.is_lock = int.Parse(bullet_data[7].ToString());
+						this.bullet.lock_id = bullet_data[7].ToString();
+						this.bullet.is_rage = int.Parse(bullet_data[8].ToString());
+					}
+				}
+			}
+			catch(System.Exception e){
+                Debug.LogWarning(e);
+            }
+		}
+	}
+
+	//子弹发射消息
+	public struct FireResponse : IResponse{
+		public long gold_amount;
+
+		//解析
+		public void ParseData (LitJson.JsonData json_data){
+			try{
+				if(json_data.Keys.Contains("dt")){
+					JsonData bullet_data = json_data["dt"];
+					this.gold_amount = long.Parse(bullet_data.ToString());
+				}
+			}
+			catch(System.Exception e){
+                Debug.LogWarning(e);
+            }
+		}
+	}
+	//碰撞返回
+	public struct MatchHitResponse : IResponse{
+		public string bullet_id;
+		public long match_gold_amount;
+		public uint match_diamond_amount;
+		public List<DeadInfo> dead_fishs;
+		public List<BuffInfo> bufffish;
+		//解析
+		public void ParseData (LitJson.JsonData json_data){
+			try{
+				if(json_data.Keys.Contains("dt")){
+					JsonData bullet_data = json_data["dt"];
+					if(bullet_data.IsArray && bullet_data.Count >= 5){
+						this.bullet_id = bullet_data[0].ToString();
+						this.match_gold_amount = long.Parse(bullet_data[1].ToString());
+						this.match_diamond_amount=uint.Parse(bullet_data[2].ToString());
+						if (bullet_data.Count>=5&&bullet_data[4].ToString()!="null") {
+							JsonData bf=bullet_data[4];
+							bufffish=new List<BuffInfo>();
+							foreach (string var in bf.Keys) {
+								int item=int.Parse(var);
+								BuffInfo buff=new BuffInfo(){bufftype=item,fishid=bf[var][0].ToString(),award=int.Parse(bf[var][1].ToString())};
+								bufffish.Add(buff);
+							}
+						}
+					}
+					//JsonData JsonDataThree=bullet_data[2];
+					//if (bullet_data.Count>5&&bullet_data[5].ToString()!="null") {
+					//JsonData bf=bullet_data[5];
+					//bufffish=new List<BuffInfo>();
+					//foreach (string var in bf.Keys) {
+					//int item=int.Parse(var);
+					//BuffInfo buff=new BuffInfo(){bufftype=item,fishid=bf[var][0].ToString(),award=int.Parse(bf[var][1].ToString())};
+					//bufffish.Add(buff);
+					//     }
+					//}
+					if(bullet_data.Count > 4 && bullet_data[3].ToString() != "null"){
+						JsonData fd1 = bullet_data[3];
+						if(fd1.Count>0){
+							this.dead_fishs = new List<DeadInfo>();
+							//检查是否有炸弹
+							if(fd1.Keys.Contains(FishSyncGeneratorU3D.BombID)){
+								DeadInfo ds=new DeadInfo();
+								ds.id=FishSyncGeneratorU3D.BombID;
+								dead_fishs.Add(ds);
+							}
+							foreach(string k1 in fd1.Keys){
+								if(k1 != FishSyncGeneratorU3D.BombID){  //炸弹的话跳过
+									DeadInfo de=new DeadInfo();
+									de.id=k1;
+									JsonData fd2 = fd1[k1];
+									if(fd2.IsArray && fd2.Count == 2){
+										de.rate = uint.Parse(fd2[0].ToString());
+										JsonData fd3 = fd2[1];
+										de.prizes = new PrizeInfo[fd3.Count];
+										int j=0;
+										foreach(string k2 in fd3.Keys){
+											de.prizes[j].prize_type = int.Parse(k2);
+											de.prizes[j].prize_amount = uint.Parse(fd3[k2].ToString());
+											j++;
+										}
+									}
+									dead_fishs.Add(de);
+								}
+							}
+						}
+					}
+				}
+			}
+			catch(System.Exception e){
+                Debug.LogWarning(e);
+            }
+		}
+	}
+
+	//碰撞返回
+	public struct HitResponse : IResponse{
+		public string bullet_id;
+		public long gold_amount;
+		public int rank_percent;
+		public List<DeadInfo> dead_fishs;
+		public BigBossInfo big_boss;
+		public List<BuffInfo> bufffish;
+		public bool isgoldsyc;//是否立马金币同步
+		public IntegralData interaldata;
+		//解析
+		public void ParseData (LitJson.JsonData json_data){
+			try{
+				if(json_data.Keys.Contains("dt")){
+					isgoldsyc=false;
+					bool	tmp_isbuffhava=false;//buff是否有年兽鱼;
+					JsonData bullet_data = json_data["dt"];
+					if(bullet_data.IsArray && bullet_data.Count >= 3){
+						this.bullet_id = bullet_data[0].ToString();
+						this.gold_amount = long.Parse(bullet_data[1].ToString());
+						this.rank_percent = int.Parse(bullet_data[2].ToString());
+						if (bullet_data.Count>5&&bullet_data[5].ToString()!="null") {
+							JsonData bf=bullet_data[5];
+							bufffish=new List<BuffInfo>();
+							foreach (string var in bf.Keys) {
+								int item=int.Parse(var);
+								BuffInfo buff=new BuffInfo(){bufftype=item,fishid=bf[var][0].ToString(),award=int.Parse(bf[var][1].ToString())};
+								bufffish.Add(buff);
+								if(FishSyncGeneratorU3D.Instance!=null){
+									FishViewU3D fish=FishSyncGeneratorU3D.Instance.GetFish (bf[var][0].ToString());
+									if(fish!=null&&fish.code==107){
+										tmp_isbuffhava=true;
+									}
+								}
+							}
+						}
+						if(bullet_data.Count > 3 && bullet_data[3].ToString() != "null"){
+							JsonData fd1 = bullet_data[3];
+							if(fd1.Count>0){
+								this.dead_fishs = new List<DeadInfo>();
+								//检查是否有炸弹
+								if(fd1.Keys.Contains(FishSyncGeneratorU3D.BombID)){
+									DeadInfo ds=new DeadInfo();
+									ds.id=FishSyncGeneratorU3D.BombID;
+									dead_fishs.Add(ds);
+								}
+								foreach(string k1 in fd1.Keys){
+									if(k1 != FishSyncGeneratorU3D.BombID){  //炸弹的话跳过
+										DeadInfo de=new DeadInfo();
+										de.id=k1;
+										JsonData fd2 = fd1[k1];
+										if(fd2.IsArray && fd2.Count == 2){
+											de.rate = uint.Parse(fd2[0].ToString());
+											JsonData fd3 = fd2[1];
+											de.prizes = new PrizeInfo[fd3.Count];
+											int j=0;
+											foreach(string k2 in fd3.Keys){
+												de.prizes[j].prize_type = int.Parse(k2);
+												de.prizes[j].prize_amount = uint.Parse(fd3[k2].ToString());
+												j++;
+											}
+										}
+										if(!tmp_isbuffhava){
+											if(FishSyncGeneratorU3D.Instance!=null){
+												FishViewU3D fish=FishSyncGeneratorU3D.Instance.GetFish (k1);
+												if(fish!=null&&fish.code==107){
+													isgoldsyc=true;
+												}
+											}
+										}
+										dead_fishs.Add(de);
+									}
+								}
+							}
+						}
+						if(bullet_data.Count > 4 && bullet_data[4].ToString() != "null"){
+							JsonData bd = bullet_data[4];
+							if(bd.IsArray && bd.Count == 5){
+								this.big_boss = new BigBossInfo();
+								this.big_boss.callplay_id= uint.Parse(bd[0].ToString());
+								this.big_boss.id = bd[1].ToString();
+								this.big_boss.is_die = bool.Parse(bd[2].ToString());
+								if(bd[3].Count > 0){
+									big_boss.catch_prizes = new PrizeInfo[bd[3].Count];
+									int i=0;
+									foreach(string k1 in bd[3].Keys){
+										this.big_boss.catch_prizes[i].prize_type = int.Parse(k1);
+										this.big_boss.catch_prizes[i].prize_amount = uint.Parse(bd[3][k1].ToString());
+										i++;
+									}
+								}
+								if(bd[4].Count > 0){
+									big_boss.call_prizes = new PrizeInfo[bd[4].Count];
+									int i=0;
+									foreach(string k2 in bd[4].Keys){
+										this.big_boss.call_prizes[i].prize_type = int.Parse(k2);
+										this.big_boss.call_prizes[i].prize_amount = uint.Parse(bd[4][k2].ToString());
+										i++;
+									}
+								}
+							}
+						}
+						interaldata=new IntegralData();
+						if(bullet_data.Count>6&&bullet_data[6]!=null){
+							JsonData jsondata6=bullet_data[6];
+							if(jsondata6.IsArray&&jsondata6.Count==2){
+								interaldata.server_time=(long)double.Parse(jsondata6[0].ToString());
+								interaldata.total_num_points=long.Parse(jsondata6[1].ToString());
+								interaldata.isok=true;
+							}
+						}
+
+					}
+				}
+			}
+			catch(System.Exception e){
+                Debug.LogWarning(e);
+            }
+		}
+	}
+
+
+	//发送子弹碰撞请求
+	public struct MatchHitRequest : IRequest{
+		public int cc;
+		public string bullet_id;
+		public double pos_x;
+		public double pos_y;
+		public int hit_type;
+		public string[] fishs;  //第一个为子弹碰撞的鱼
+
+		public string GenerateData(){
+			string json = null;
+			try{
+				JsonData json_data = new JsonData();
+				json_data["cc"] = 207;
+				json_data["av"] = new JsonData();
+				json_data["av"].Add(this.bullet_id);
+				json_data["av"].Add(this.pos_x);
+				json_data["av"].Add(this.pos_y);
+				json_data["av"].Add(this.hit_type);
+				for(int i=0;i<fishs.Length; i++){
+					json_data["av"].Add(this.fishs[i]);
+				}
+
+				json = JsonMapper.ToJson(json_data);
+			}
+			catch(System.Exception e){
+                Debug.LogWarning(e);
+            }
+			return json;
+		}
+	}
+	#endregion
+
+	// 发射一个子弹
+	public void Launch(WeaponPanelViewU3D.ShootReadyArgs ready){
+		LaunchRequest request = new LaunchRequest (){
+			client_cmd = "bullet-launch",
+			pos_x = System.Math.Round(ready.pos.x, 4),
+			pos_y = System.Math.Round(ready.pos.y, 4),
+//			is_lock = ready.is_lock?1:0,
+			lock_id = ready.lock_id,
+			is_rage = ready.is_rage?1:0,
+		};
+		this.SendRequest (request);
+	}
+
+	public void Fire(WeaponPanelViewU3D.ShootReadyArgs ready, bool isPower = false){
+		FireRequest request = new FireRequest () {
+			cc = 204,
+			bullet_id = ready.id,
+			pos_x = System.Math.Round(ready.pos.x, 4),
+			pos_y = System.Math.Round(ready.pos.y, 4),
+//			is_lock = ready.is_lock?1:0,
+			lock_id = ready.lock_id,
+			is_rage = ready.is_rage?1:0,
+		};
+		this.SendRequest (request);
+		if (!isPower) {
+			long gold = _playerModel.Gold;
+			int bet = (int)_playerModel.Bet;
+			bet = (request.is_rage + 1) * bet;
+			long result = gold - bet;
+			if (result >= 0)
+				_playerModel.Gold = result;
+		}
+	}
+
+	//发送一个子弹碰撞
+	public void Hit(HitRequest request){
+		this.SendRequest (request);
+	}
+
+	//换炮
+	public void Change(uint r){
+		_playerModel.Bet = r;  //优先特殊处理
+		ChangeRequest request = new ChangeRequest () {
+			cc =203,
+			av = r,
+		};
+		this.SendRequest (request);
+	}
+	public void SycGold(bool varbool=true)
+	{
+		if(varbool){
+		_playerModel.Gold = tmpGold;  //更新金币数
+		}
+		isSysGold=true;
+	}
+
+	#region 多人或邀请比赛场(Match)//========================
+
+	//发送子弹的请求
+	private struct MatchFireRequest : IRequest{
+		public int cc;
+		public string bullet_id;
+		public double pos_x;
+		public double pos_y;
+		//public int is_lock;
+
+		public string GenerateData(){
+			string json = null;
+			try{
+				JsonData json_data = new JsonData();
+				json_data["cc"] = cc;
+				json_data["av"] = new JsonData();
+				json_data["av"].Add(this.bullet_id);
+				json_data["av"].Add(this.pos_x);
+				json_data["av"].Add(this.pos_y);
+				json = JsonMapper.ToJson(json_data);
+			}
+			catch(System.Exception e){
+                Debug.LogWarning(e);
+            }
+			return json;
+		}
+			
+	}
+
+	public void MatchFire(WeaponPanelViewU3D.ShootReadyArgs ready){
+		MatchFireRequest request = new MatchFireRequest () {
+			cc = 206,
+			bullet_id = ready.id,
+			pos_x = System.Math.Round(ready.pos.x, 4),
+			pos_y = System.Math.Round(ready.pos.y, 4),
+		};
+		this.SendRequest (request);
+	}
+
+	//子弹发射消息
+	public struct MatchFireResponse : IResponse{
+		public int Bullet_amout;
+		public int WeaponType;
+
+		//解析
+		public void ParseData (LitJson.JsonData json_data){
+			try{
+				if(json_data.Keys.Contains("dt")){
+					JsonData bullet_data = json_data["dt"];
+					if(bullet_data.IsArray&&bullet_data.Count==2)
+					{
+						WeaponType=int.Parse(bullet_data[0].ToString());
+						Bullet_amout=int.Parse(bullet_data[1].ToString());
+					}
+				}
+			}
+			catch(System.Exception e){
+                Debug.LogWarning(e);
+			}
+		}
+	}
+
+	//发送一个子弹碰撞
+	public void MatchHit(MatchHitRequest request){
+		this.SendRequest (request);
+	}
+
+
+	//宝石抽炮
+	//宝石购买武器;
+	public event GameNotifyDelegate MatchOnUse;
+
+	private struct MatchBuyWeaponRequest : IRequest{
+		public int cc;
+		public int av;
+		//public int is_lock;
+
+		public string GenerateData(){
+			string json = null;
+			try{
+				JsonData json_data = new JsonData();
+				json_data["cc"] = cc;
+				json_data["av"] = av;
+				json = JsonMapper.ToJson(json_data);
+			}
+			catch(System.Exception e){
+                Debug.LogWarning(e);
+			}
+			return json;
+		}
+
+	}
+
+	public void MatchBuyWeapon(int r){
+
+		MatchBuyWeaponRequest request = new MatchBuyWeaponRequest () {
+			cc =208,
+			av = r,
+		};
+		this.SendRequest (request);
+	}
+
+	public struct MatchBuyWeaponResponse : IResponse{
+		public int weapontype;
+		public int weapon_amount;
+		public uint match_daimond;
+		public void ParseData (LitJson.JsonData json_data){
+			try {
+				if(json_data.Keys.Contains("dt"))
+				{
+					JsonData jsondata_dt=json_data["dt"];
+					if(jsondata_dt.IsArray&&jsondata_dt.Count==2)
+					{
+						this.weapontype=int.Parse(jsondata_dt[0].ToString());
+						this.match_daimond=uint.Parse(jsondata_dt[1].ToString());
+					}
+				}
+
+			} catch (System.Exception e) {
+                Debug.LogWarning(e);
+            }
+		}
+	}
+
+	#endregion
+
+	//收到数据的处理
+	public override void Receive(string type, JsonData json_data){
+		if (_playerModel.PlayerInfo == null) {
+			return;
+		}
+		if (type == "launch") {
+			try {
+				LaunchResponse response = new LaunchResponse ();
+				response.ParseData (json_data);  //解析数据
+				if (response.position == _playerModel.PlayerInfo.position) {
+					_playerModel.Gold = response.gold_amount;  //更新金币数
+					if (LaunchCallback != null)
+						LaunchCallback ("bullet ctrl receive launch", this, response);
+				} else {
+					if (OnOtherLaunch != null) {
+						OnOtherLaunch ("bullet ctrl receive other launch", this, response);
+					}
+				}
+			} catch (System.Exception e) {
+                Debug.LogWarning(e);
+            }
+		} else if (type == "204") {/*子弹发射*/
+			try {
+				FireResponse response = new FireResponse ();
+				response.ParseData (json_data);  //解析数据
+//				_playerModel.Gold = response.gold_amount;  //更新金币数
+				if (FireCallback != null)
+					FireCallback ("bullet ctrl receive fire", this, response);
+				
+			} catch (System.Exception e) {
+                Debug.LogWarning(e);
+            }
+		} else if (type == "205") {/*子弹碰撞(hit)*/
+			try {
+				HitResponse response = new HitResponse ();
+				response.ParseData (json_data);
+
+				tmpGold=response.gold_amount;
+				if(response.isgoldsyc){
+					isSysGold=false;
+				}
+				if(isSysGold){
+					_playerModel.Gold = response.gold_amount;  //更新金币数
+					notshoottime=0;
+				}
+				else{
+					notshoottime++;
+					if(notshoottime>4){
+						isSysGold=true;
+						notshoottime=0;
+					}
+				}
+				if(response.interaldata.isok){
+					_playerModel.FreeSenceIntegral =response.interaldata.total_num_points;
+					_playerModel.TimeStampTransmit(response.interaldata.server_time);
+				}
+				if (HitCallback != null) {
+					HitCallback ("bullet ctrl receive hit", this, response);
+				}
+			} catch (System.Exception e) {
+                Debug.LogWarning(e);
+
+            }
+		} else if (type == "206") {/*fire多人比赛场子弹发射*/
+			try {
+				MatchFireResponse response = new MatchFireResponse ();
+				response.ParseData (json_data);  //解析数据
+				if(response.WeaponType==0)
+				{
+				_playerModel.Match_Bullet = (uint)response.Bullet_amout;  //更新金币数
+				}
+
+				if (FireCallback != null)
+					FireCallback ("bullet ctrl receive fire", this, response);
+
+			} catch (System.Exception e) {
+                Debug.LogWarning(e);
+            }
+		}
+		else if(type == "207")/*Hit多人比赛场子弹碰撞*/
+		{
+			MatchHitResponse response = new MatchHitResponse ();
+			response.ParseData (json_data);
+//			if(response.dead_fishs!=null)
+//			{
+//				for (int i = 0; i < response.dead_fishs.Count; i++) {
+//					if (response.dead_fishs [i].prizes != null) {
+//						for (int j = 0; j < response.dead_fishs [i].prizes.Length; j++) {
+//							if(response.dead_fishs [i].prizes[j].prize_type==109)
+//							{
+//								_playerModel.Match_Diamond += response.dead_fishs [i].prizes [j].prize_amount;
+//							}
+//						}
+//					}
+//				}
+//			}
+			if(response.dead_fishs!=null&&response.dead_fishs.Count>0)
+			{
+				if (response.dead_fishs [0].prizes == null) {
+					FishViewU3D fish = FishSyncGeneratorU3D.Instance.GetFish (response.dead_fishs [0].id);
+					if (fish && (fish.fishType == FishType.LITTLE_TNT || fish.fishType == FishType.ALL_TNT)) {
+						_matchplayerModel.OnselfAddAchieveCount (_playerModel.PlayerInfo.position,"Catch_TNT",1);
+					}
+				} else {
+						for (int i = 0; i < response.dead_fishs.Count; i++) {
+							FishViewU3D fish = FishSyncGeneratorU3D.Instance.GetFish (response.dead_fishs [i].id);
+						    if(fish)
+							{
+								if(fish.fishType==FishType.BOSS)
+								{
+								  _matchplayerModel.OnselfAddAchieveCount (_playerModel.PlayerInfo.position,"Catch_Boss",1);
+								}
+							}
+						}
+				}
+			}
+			_playerModel.Match_Diamond=response.match_diamond_amount;  //更新钻石分数
+			_playerModel.Match_Gold=response.match_gold_amount;  //更新金币分数
+
+			if (HitCallback != null) {
+				HitCallback ("bullet ctrl receive hit", this, response);
+			}
+		}
+		else if (type == "203") {//change
+			
+		}
+		else if(type=="208")
+		{
+			try {
+			   if(MatchOnUse!=null)
+				{
+					MatchBuyWeaponResponse response=new MatchBuyWeaponResponse();
+					response.ParseData(json_data);
+					if((WeaponType)response.weapontype==WeaponType.Ninja)
+					{
+						_matchplayerModel.OnselfAddAchieveCount(_playerModel.PlayerInfo.position,"WeaponType_Ninja",1);
+
+					}
+					else if((WeaponType)response.weapontype==WeaponType.Lightning)
+					{
+						_matchplayerModel.OnselfAddAchieveCount(_playerModel.PlayerInfo.position,"WeaponType_Lightning",1);
+					}
+					else if((WeaponType)response.weapontype==WeaponType.Laser)
+					{
+						_matchplayerModel.OnselfAddAchieveCount(_playerModel.PlayerInfo.position,"WeaponType_Laser",1);
+					}
+					_playerModel.Match_Diamond=response.match_daimond;
+					MatchOnUse("diamond buy is ok",this,response);
+		}
+
+			} catch (System.Exception e) {
+                Debug.LogWarning(e);
+            }
+		}
+	}
+}
